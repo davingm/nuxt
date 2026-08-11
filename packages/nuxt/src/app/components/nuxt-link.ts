@@ -1,18 +1,17 @@
 import type {
-  AllowedComponentProps,
   AnchorHTMLAttributes,
   ComputedRef,
   DefineSetupFnComponent,
   InjectionKey,
   MaybeRef,
   PropType,
+  PublicProps,
   SlotsType,
-  UnwrapRef,
   VNode,
-  VNodeProps,
 } from 'vue'
 import { computed, defineComponent, h, inject, onBeforeUnmount, onMounted, provide, ref, resolveComponent, shallowRef, unref } from 'vue'
-import type { RouteLocation, RouteLocationRaw, Router, RouterLink, RouterLinkProps, UseLinkReturn, useLink } from 'vue-router'
+import type { ComponentSlots } from 'vue-component-type-helpers'
+import type { RouteLocation, RouteLocationRaw, Router, RouterLink, RouterLinkProps, useLink } from 'vue-router'
 import { hasProtocol, isScriptProtocol, joinURL, parseQuery, withTrailingSlash, withoutTrailingSlash } from 'ufo'
 import { preloadRouteComponents } from '../composables/preload'
 import { onNuxtReady } from '../composables/ready'
@@ -20,11 +19,13 @@ import { encodeRoutePath, navigateTo, resolveRouteObject, useRouter } from '../c
 import { useNuxtApp, useRuntimeConfig } from '../nuxt'
 import type { NuxtApp } from '../nuxt'
 import { cancelIdleCallback, requestIdleCallback } from '../compat/idle-callback'
+import { renderDiagnostics } from '../diagnostics/render'
+import { navigationDiagnostics } from '../diagnostics/navigation'
 
-// @ts-expect-error virtual file
-import { nuxtLinkDefaults } from '#build/nuxt.config.mjs'
+import { componentIslands, nuxtLinkDefaults } from '#build/nuxt.config.mjs'
 
 import { hashMode } from '#build/router.options.mjs'
+import type { NuxtLinkOptions } from '../types'
 
 const firstNonUndefined = <T> (...args: (T | undefined)[]) => args.find(arg => arg !== undefined)
 
@@ -52,6 +53,8 @@ function sanitizeExternalHref (value: string): string | null {
 }
 
 const NuxtLinkDevKeySymbol: InjectionKey<boolean> = Symbol('nuxt-link-dev-key')
+
+export type { NuxtLinkOptions } from '../types'
 
 /**
  * `<NuxtLink>` is a drop-in replacement for both Vue Router's `<RouterLink>` component and HTML's `<a>` tag.
@@ -109,65 +112,35 @@ export interface NuxtLinkProps<CustomProp extends boolean = false> extends Omit<
   trailingSlash?: 'append' | 'remove'
 }
 
-/**
- * Create a NuxtLink component with given options as defaults.
- * @see https://nuxt.com/docs/4.x/api/components/nuxt-link
- */
-export interface NuxtLinkOptions extends
-  Partial<Pick<RouterLinkProps, 'activeClass' | 'exactActiveClass'>>,
-  Partial<Pick<NuxtLinkProps, 'prefetch' | 'prefetchedClass'>> {
-  /**
-   * The name of the component.
-   * @default "NuxtLink"
-   */
-  componentName?: string
-  /**
-   * A default `rel` attribute value applied on external links. Defaults to `"noopener noreferrer"`. Set it to `""` to disable.
-   */
-  externalRelAttribute?: string | null
-  /**
-   * An option to either add or remove trailing slashes in the `href`.
-   * If unset or not matching the valid values `append` or `remove`, it will be ignored.
-   */
-  trailingSlash?: 'append' | 'remove'
+type RouterLinkSlot = NonNullable<ComponentSlots<typeof RouterLink>['default']>
+type RouterLinkSlotProps = Parameters<RouterLinkSlot>[0]
 
-  /**
-   * Allows controlling default setting for when to prefetch links. By default, prefetch is triggered only on visibility.
-   */
-  prefetchOn?: Exclude<NuxtLinkProps['prefetchOn'], string>
-}
-
-type NuxtLinkDefaultSlotProps<CustomProp extends boolean = false> = CustomProp extends true
-  ? {
-      href: string | null
-      navigate: (e?: MouseEvent) => Promise<void>
-      prefetch: (nuxtApp?: NuxtApp) => Promise<void>
-      prefetched: boolean
-      shouldPrefetch: (mode: 'visibility' | 'interaction') => boolean
-      route: (RouteLocation & { href: string }) | undefined
-      rel: string | null
-      target: '_blank' | '_parent' | '_self' | '_top' | (string & {}) | null
-      isExternal: boolean
-      isActive: boolean
-      isExactActive: boolean
-    }
-  : UnwrapRef<UseLinkReturn>
-
-type RouterLinkSlotProps = Partial<Pick<NuxtLinkDefaultSlotProps<true>, 'href' | 'navigate' | 'route' | 'isActive' | 'isExactActive'>>
-
-type NuxtLinkSlots<CustomProp extends boolean = false> = {
-  default?: (props: NuxtLinkDefaultSlotProps<CustomProp>) => VNode[]
-}
+type NuxtLinkSlotProps<CustomProp extends boolean = false> = CustomProp extends true
+  ? Omit<RouterLinkSlotProps, 'href' | 'route'> & {
+    href: RouterLinkSlotProps['href'] | null
+    route: RouterLinkSlotProps['route'] | undefined
+    prefetch: (nuxtApp?: NuxtApp) => Promise<void>
+    prefetched: boolean
+    shouldPrefetch: (mode: 'visibility' | 'interaction') => boolean
+    rel: string | null
+    target: '_blank' | '_parent' | '_self' | '_top' | (string & {}) | null
+    isExternal: boolean
+  }
+  : RouterLinkSlotProps
 
 type NuxtLinkComponentProps<CustomProp extends boolean = false> =
-  NuxtLinkProps<CustomProp> & VNodeProps & AllowedComponentProps & Omit<AnchorHTMLAttributes, keyof NuxtLinkProps<CustomProp>>
+  NuxtLinkProps<CustomProp> & PublicProps & Omit<AnchorHTMLAttributes, keyof NuxtLinkProps<CustomProp>>
 
 type NuxtLinkComponentInstance<CustomProp extends boolean = false> = InstanceType<DefineSetupFnComponent<
   NuxtLinkComponentProps<CustomProp>,
   [],
-  SlotsType<NuxtLinkSlots<CustomProp>>
+  SlotsType<{
+    default?: (props: NuxtLinkSlotProps<CustomProp>) => VNode[]
+  }>
 >>
 
+// the non-generic signatures are required for `ComponentProps`/`ComponentSlots` and Vue Language
+// Tools to resolve the component: inference against a solely generic construct signature yields `{}`
 export type NuxtLinkComponent = {
   new (
     props: NuxtLinkComponentProps<true> & { custom: true }
@@ -186,7 +159,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
 
   function checkPropConflicts (props: NuxtLinkProps, main: keyof NuxtLinkProps, sub: keyof NuxtLinkProps): void {
     if (import.meta.dev && props[main] !== undefined && props[sub] !== undefined) {
-      console.warn(`[${componentName}] \`${main}\` and \`${sub}\` cannot be used together. \`${sub}\` will be ignored.`)
+      renderDiagnostics.NUXT_E4010({ componentName, main, sub })
     }
   }
 
@@ -295,7 +268,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
       async navigate (_e?: MouseEvent) {
         if (href.value === null) {
           if (import.meta.dev) {
-            console.warn(`[${componentName}] refused to navigate to a URL with a script-capable protocol.`)
+            navigationDiagnostics.NUXT_E2011({ componentName })
           }
           return
         }
@@ -474,7 +447,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
       if (import.meta.dev && import.meta.server && !props.custom) {
         const isNuxtLinkChild = inject(NuxtLinkDevKeySymbol, false)
         if (isNuxtLinkChild) {
-          console.log('[nuxt] [NuxtLink] You can\'t nest one <a> inside another <a>. This will cause a hydration error on client-side. You can pass the `custom` prop to take full control of the markup.')
+          renderDiagnostics.NUXT_E4009()
         } else {
           provide(NuxtLinkDevKeySymbol, true)
         }
@@ -497,7 +470,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
           (isAbsoluteUrl.value || hasTarget.value) ? 'noopener noreferrer' : '',
         ) || null
 
-        const getCustomSlotProps = (routerLinkSlotProps?: RouterLinkSlotProps): NuxtLinkDefaultSlotProps<true> => ({
+        const getCustomSlotProps = (routerLinkSlotProps?: RouterLinkSlotProps): NuxtLinkSlotProps<true> => ({
           href: href.value,
           navigate,
           get route () {
@@ -515,7 +488,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
               redirectedFrom: undefined,
               meta: {},
               href: href.value,
-            } satisfies RouteLocation & { href: string }
+            } as unknown as RouteLocation & { href: string }
           },
           rel,
           target,
@@ -529,7 +502,7 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
         })
 
         if (!isExternal.value && !hasTarget.value && !isHashLinkWithoutHashMode(to.value)) {
-          const routerLinkProps: RouterLinkProps & VNodeProps & AllowedComponentProps & AnchorHTMLAttributes = {
+          const routerLinkProps: RouterLinkProps & PublicProps & AnchorHTMLAttributes & { 'data-internal'?: string } = {
             ref: elRef,
             to: to.value,
             activeClass: props.activeClass || options.activeClass,
@@ -552,6 +525,15 @@ export function defineNuxtLink (options: NuxtLinkOptions): NuxtLinkComponent & R
               }
             }
             routerLinkProps.rel = props.rel || undefined
+
+            if (import.meta.server && componentIslands && useNuxtApp().ssrContext?.islandContext) {
+              // marks internal links within island HTML for client-side navigation
+              const flags: string[] = []
+              if (props.replace) { flags.push('replace') }
+              const prefetchOnVisibility = typeof props.prefetchOn === 'string' ? props.prefetchOn === 'visibility' : (props.prefetchOn?.visibility ?? options.prefetchOn?.visibility)
+              if (prefetchOnVisibility && (props.prefetch ?? options.prefetch) !== false && props.noPrefetch !== true) { flags.push('prefetch') }
+              routerLinkProps['data-internal'] = flags.join(' ')
+            }
           }
 
           // Internal link
@@ -615,6 +597,10 @@ export default NuxtLink
 
 // -- NuxtLink utils --
 function applyTrailingSlashBehavior (to: string, trailingSlash: NuxtLinkOptions['trailingSlash']): string {
+  // When `trailingSlash` is unset (or not a valid value) the URL is returned untouched
+  if (trailingSlash !== 'append' && trailingSlash !== 'remove') {
+    return to
+  }
   const normalizeFn = trailingSlash === 'append' ? withTrailingSlash : withoutTrailingSlash
   // Until https://github.com/unjs/ufo/issues/189 is resolved
   const hasProtocolDifferentFromHttp = hasProtocol(to) && !to.startsWith('http')
@@ -628,7 +614,8 @@ function applyTrailingSlashBehavior (to: string, trailingSlash: NuxtLinkOptions[
 type CallbackFn = () => void
 type ObserveFn = (element: Element, callback: CallbackFn) => () => void
 
-function useObserver (): { observe: ObserveFn } | undefined {
+/** @internal */
+export function useObserver (): { observe: ObserveFn } | undefined {
   if (import.meta.server) { return }
 
   const nuxtApp = useNuxtApp()
@@ -668,7 +655,8 @@ function useObserver (): { observe: ObserveFn } | undefined {
 }
 
 const IS_2G_RE = /2g/
-function isSlowConnection () {
+/** @internal */
+export function isSlowConnection () {
   if (import.meta.server) { return }
 
   // https://developer.mozilla.org/en-US/docs/Web/API/Navigator/connection

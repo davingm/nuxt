@@ -6,14 +6,13 @@ import { propsToString } from '@unhead/vue/server'
 import { useRuntimeConfig } from 'nitro/runtime-config'
 import type { App } from 'vue'
 
-import type { NuxtSSRContext } from 'nuxt/app'
+import type { NuxtSSRContext } from '#app/types'
 
-// @ts-expect-error virtual file
 import { NUXT_NO_SSR } from '#internal/nuxt/nitro-config.mjs'
-// @ts-expect-error virtual file
 import { appRootAttrs, appRootTag, appSpaLoaderAttrs, appSpaLoaderTag, spaLoadingTemplateOutside } from '#internal/nuxt.config.mjs'
 import { buildAssetsURL, publicAssetsURL } from '../paths'
 import { lazyCachedFunction } from './cache'
+import { serverDiagnostics } from '../../diagnostics'
 
 type Entry = (ssrContext: NuxtSSRContext) => Promise<App>
 
@@ -50,7 +49,7 @@ interface Renderer {
 export const getSSRRenderer: () => Promise<Renderer> = lazyCachedFunction(async (): Promise<Renderer> => {
   // Load server bundle
   const createSSRApp = await getServerEntry()
-  if (!createSSRApp) { throw new Error('Server bundle is not available') }
+  if (!createSSRApp) { throw serverDiagnostics.NUXT_E8004() }
 
   // Load precomputed dependencies
   const precomputed = import.meta.dev ? undefined : await getPrecomputedDependencies()
@@ -83,7 +82,6 @@ export const getSSRRenderer: () => Promise<Renderer> = lazyCachedFunction(async 
 const getSPARenderer = lazyCachedFunction(async (): Promise<Renderer> => {
   const precomputed = import.meta.dev ? undefined : await getPrecomputedDependencies()
 
-  // @ts-expect-error virtual file
   const spaTemplate = await import('#spa-template').then(r => r.template).catch(() => '')
     .then((r) => {
       if (spaLoadingTemplateOutside) {
