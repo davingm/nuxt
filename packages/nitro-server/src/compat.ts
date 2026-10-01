@@ -3,19 +3,20 @@ import type { Dirent } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { dirname, isAbsolute, join, normalize, resolve } from 'pathe'
 import MagicString from 'magic-string'
+import { parseSync } from 'rolldown/utils'
 import { withTrailingSlash } from 'ufo'
 import { createUnimport } from 'unimport'
 import type { Unimport } from 'unimport'
 import { resolveModulePath } from 'exsolve'
+import escapeRE from 'escape-string-regexp'
 import { getLayerDirectories, resolveAlias } from '@nuxt/kit'
 import { trackPendingTemplate } from '@nuxt/kit/internal'
 import type { Nuxt, ServerApi } from '@nuxt/schema'
-import type { NitroConfig, NitroOptions } from 'nitro/types'
+import type { Nitro, NitroConfig, NitroOptions } from 'nitro/types'
 
-import { distDir, toArray } from './utils.ts'
+import { distDir, nitroImplicitDependencies, toArray } from './utils.ts'
 import { nitroBuildDiagnostics } from './diagnostics.ts'
 import { getH3ExportNames, getH3ImportsPreset, getNuxtServerImportsPreset, nuxtServerImportsPreset, v2ImportsPreset } from './imports.ts'
-import { wrapLegacyHandler } from './runtime/compat/wrapper.ts'
 import { migratedPlugins, serverApiOf } from './registrations.ts'
 
 /**
@@ -79,79 +80,64 @@ const OWN_VIRTUAL_RE = /^(?:#internal\/|#nuxt-compat\/|#build\/|#nitro|#spa-temp
 /** Marks code written against Nitro v3 or `nuxt/server`: it must not be given v2 semantics. */
 const MIGRATED_SPECIFIER_RE = /^(?:nitro|#nitro|nuxt\/server)(?:\/|$)/
 const SPECIFIER_HINT_RE = /['"](?:h3(?:\/utils)?|nitropack|#internal\/nitro|#imports)(?:\/[^'"]*)?['"]/
-const IMPORT_KEYWORD_RE = /(?:\bfrom|\bimport|\brequire)[\s(]*$/
 
 interface ImportSpecifier {
   value: string
   /** Offset of the first character of the specifier, inside its quotes. */
   start: number
   end: number
+  /** Erased from the output, as `import type` or an all-`type` named import. */
+  typeOnly: boolean
+  /** Names imported as values. */
+  names: string[]
 }
 
-/**
- * Collect module specifiers that are actually imported, skipping anything inside a comment
- * or a string literal, so that `throw new Error("import 'h3' directly")` is not rewritten.
- */
-function findImportSpecifiers (code: string): ImportSpecifier[] {
+const STRING_LITERAL_RE = /^(['"])(.*)\1$/s
+const JSX_RE = /\.[cm]?[jt]sx$/
+
+/** Module specifiers of the static and dynamic imports and re-exports of a file. */
+function findImportSpecifiers (code: string, filename: string): ImportSpecifier[] {
+  const { module } = parseSync(filename, code, { lang: JSX_RE.test(filename) ? 'tsx' : 'ts', sourceType: 'module' })
   const specifiers: ImportSpecifier[] = []
-
-  for (let index = 0; index < code.length; index++) {
-    const char = code[index]!
-
-    if (char === '/') {
-      const next = code[index + 1]
-      if (next === '/') {
-        index = code.indexOf('\n', index + 2)
-        if (index === -1) {
-          return specifiers
-        }
-        continue
-      }
-      if (next === '*') {
-        const end = code.indexOf('*/', index + 2)
-        if (end === -1) {
-          return specifiers
-        }
-        index = end + 1
-        continue
-      }
-      continue
+  const add = (request: { start: number, end: number }, entries?: Array<{ isType: boolean, importName: { name: string | null } }>) => {
+    const literal = code.slice(request.start, request.end).match(STRING_LITERAL_RE)
+    if (literal) {
+      const values = entries?.filter(entry => !entry.isType) ?? []
+      specifiers.push({
+        value: literal[2]!,
+        start: request.start + 1,
+        end: request.end - 1,
+        typeOnly: !!entries?.length && values.length === 0,
+        names: values.flatMap(entry => entry.importName.name ?? []),
+      })
     }
-
-    if (char !== '\'' && char !== '"' && char !== '`') {
-      continue
-    }
-
-    // find the end of the literal, honouring escapes
-    let end = index + 1
-    while (end < code.length && code[end] !== char) {
-      end += code[end] === '\\' ? 2 : 1
-    }
-    if (end >= code.length) {
-      return specifiers
-    }
-
-    if (char !== '`' && IMPORT_KEYWORD_RE.test(code.slice(Math.max(0, index - 32), index))) {
-      specifiers.push({ value: code.slice(index + 1, end), start: index + 1, end })
-    }
-
-    index = end
   }
-
-  return specifiers
+  for (const entry of module.staticImports) {
+    add(entry.moduleRequest, entry.entries)
+  }
+  for (const entry of module.staticExports) {
+    const reexports = entry.entries.filter(e => e.moduleRequest)
+    if (reexports.length > 0) {
+      add(reexports[0]!.moduleRequest!, reexports)
+    }
+  }
+  for (const entry of module.dynamicImports) {
+    add(entry.moduleRequest)
+  }
+  return specifiers.sort((a, b) => a.start - b.start)
 }
 
 /** Specifiers only code written for nitro v2 / h3 v1 imports. */
 const LEGACY_SPECIFIER_RE = /^(?:h3(?:\/utils)?$|#imports$|nitropack(?:\/|$)|#internal\/nitro(?:\/|$))/
 
 /** The specifiers that say a file is nitro v2 code. A migrated specifier wins over a legacy one. */
-function legacySpecifiers (code: string, migratedVirtuals?: Set<string>): string[] {
+function legacySpecifiers (code: string, filename: string, migratedVirtuals?: Set<string>): string[] {
   const legacy = new Set<string>()
-  for (const specifier of findImportSpecifiers(code)) {
+  for (const specifier of findImportSpecifiers(code, filename)) {
     if (MIGRATED_SPECIFIER_RE.test(specifier.value) || migratedVirtuals?.has(specifier.value)) {
       return []
     }
-    if (LEGACY_SPECIFIER_RE.test(specifier.value)) {
+    if (!specifier.typeOnly && LEGACY_SPECIFIER_RE.test(specifier.value)) {
       legacy.add(specifier.value)
     }
   }
@@ -169,7 +155,7 @@ export function scanLegacyScope (files: Iterable<string>, dirs: Iterable<string>
   const found = new Map<string, string[]>()
   const seen = new Set<string>()
   for (const [id, code] of sources) {
-    const specifiers = legacySpecifiers(code, migratedVirtuals)
+    const specifiers = legacySpecifiers(code, id, migratedVirtuals)
     if (specifiers.length > 0) {
       found.set(id, specifiers)
     }
@@ -185,7 +171,7 @@ export function scanLegacyScope (files: Iterable<string>, dirs: Iterable<string>
     } catch {
       return
     }
-    const specifiers = legacySpecifiers(code, migratedVirtuals)
+    const specifiers = legacySpecifiers(code, path, migratedVirtuals)
     if (specifiers.length > 0) {
       found.set(path, specifiers)
     }
@@ -220,6 +206,55 @@ export function scanLegacyScope (files: Iterable<string>, dirs: Iterable<string>
   return found
 }
 
+const NODE_BRIDGE_RE = /\.node\s*\??\.\s*(?:req|res)\b/
+
+/** Nitro v2 APIs used by a file of user server code, for `NUXT_B9005`. */
+function userLegacySignals (code: string, filename: string, h3Names: Set<string>): string[] {
+  const signals = new Set<string>()
+  for (const specifier of findImportSpecifiers(code, filename)) {
+    if (specifier.typeOnly) {
+      continue
+    }
+    if (NITRO_V2_SPECIFIER_RE.test(specifier.value)) {
+      signals.add(`\`${specifier.value}\``)
+    } else if (specifier.value === 'h3' || specifier.value === 'h3/utils') {
+      for (const name of specifier.names) {
+        if (!/^[A-Z]/.test(name) && !h3Names.has(name)) {
+          signals.add(`\`${name}\` from \`h3\``)
+        }
+      }
+    }
+  }
+  if (NODE_BRIDGE_RE.test(code)) {
+    signals.add('`event.node`')
+  }
+  return [...signals]
+}
+
+async function reportUserLegacyCode (dirs: string[]): Promise<void> {
+  const files = listFiles(dirs.map(dir => normalize(dir)))
+  if (files.length === 0) {
+    return
+  }
+  const h3Names = new Set(await getH3ExportNames())
+  const found: string[] = []
+  for (const path of files) {
+    let code: string
+    try {
+      code = readFileSync(path, 'utf8')
+    } catch {
+      continue
+    }
+    const signals = userLegacySignals(code, path, h3Names)
+    if (signals.length > 0) {
+      found.push(`\`${path}\` (uses ${signals.join(', ')})`)
+    }
+  }
+  if (found.length > 0) {
+    nitroBuildDiagnostics.NUXT_B9005({ count: found.length, files: found.join('\n  - ') })
+  }
+}
+
 /**
  * The virtual modules a module registered whose own contents are nitro v3 code. A module
  * that migrated behind a version-gated virtual of its own imports only that specifier, so
@@ -228,7 +263,7 @@ export function scanLegacyScope (files: Iterable<string>, dirs: Iterable<string>
 function migratedVirtualIds (sources: Map<string, string>): Set<string> {
   const migrated = new Set<string>()
   for (const [id, code] of sources) {
-    const specifiers = findImportSpecifiers(code)
+    const specifiers = findImportSpecifiers(code, id)
     if (specifiers.length > 0 && specifiers.every(specifier => MIGRATED_SPECIFIER_RE.test(specifier.value))) {
       migrated.add(id)
     }
@@ -272,7 +307,10 @@ function reachableFiles (roots: Iterable<string>, sources: Map<string, string>, 
         continue
       }
     }
-    for (const specifier of findImportSpecifiers(code)) {
+    for (const specifier of findImportSpecifiers(code, importer)) {
+      if (specifier.typeOnly) {
+        continue
+      }
       const resolved = resolveImport(specifier.value, importer)
       if (resolved) {
         add(resolved)
@@ -534,13 +572,13 @@ export async function getServerImportsPresets (legacy: ResolvedNitroLegacyOption
  * `#nuxt-compat/*` virtuals and their `tsdown` externals; the `render:response` hook,
  * `rememberRenderBody` in `utils/renderer/options.ts` and the `hasLegacyHookListener`
  * check in `handlers/renderer.ts`; the `legacyCompat` branches in `handlers/error.ts`,
- * `handlers/renderer.ts` and `utils/renderer/options.ts`; the `NUXT_B9001`-`B9004` and
+ * `handlers/renderer.ts` and `utils/renderer/options.ts`; the `NUXT_B9001`-`B9005` and
  * `NUXT_E8008`-`E8010` diagnostics; the `nitro-legacy` and `nitro-module-compat` fixtures.
  *
  * Returns a callback that absorbs registrations made after the build config was assembled;
  * call it once the nitro instance exists.
  */
-export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, legacy: ResolvedNitroLegacyOptions, modulePresets: LegacyImportsPreset[], installedModules: InstalledModule[] = [], unusedVariants: string[] = []): Promise<(nitro: { options: NitroOptions }) => Promise<void>> {
+export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, legacy: ResolvedNitroLegacyOptions, modulePresets: LegacyImportsPreset[], installedModules: InstalledModule[] = [], unusedVariants: string[] = []): Promise<(nitro: Pick<Nitro, 'options' | 'hooks'>) => void> {
   // a module may register its handler through an alias it added for the server build only
   const aliases: Record<string, string> = { ...nitroConfig.alias as Record<string, string>, ...nuxt.options.alias }
   const files = new Map<string, CompatScope>()
@@ -706,6 +744,8 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
       normalizeLegacyHandlerRoute(entry as { route?: string, middleware?: boolean, handler: string }, unrouted)
       const base = widenLegacyHandlerRoute(entry, widened)
       if (typeof entry.handler === 'function') {
+        // nitro runtime imports warn when loaded outside a Nitro build
+        const { wrapLegacyHandler } = await import('./runtime/compat/wrapper.ts')
         entry.handler = wrapLegacyHandler(entry.handler, base) as typeof entry.handler
       }
     }
@@ -741,7 +781,7 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
       continue
     }
     if (statSync(alias, { throwIfNoEntry: false })?.isDirectory()) {
-      addModuleScopeDir(alias, true)
+      addModuleScopeDir(alias)
     } else {
       addModuleScope(alias)
     }
@@ -868,7 +908,8 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
         roots.add(path)
       }
     }
-    for (const path of listFiles(entryDirs)) {
+    // user server code can import module code directly
+    for (const path of listFiles([...entryDirs, ...layerServerDirs])) {
       roots.add(path)
     }
     const reached = reachableFiles(roots, virtualSources, resolveScopeImport)
@@ -986,10 +1027,9 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
     return scope
   }
 
-  // modules pushing straight into `nitro.options` from `nitro:init` are too late for the
-  // pass above, but the transform only consults the scope at build time
-  const registerLateScope = async (nitro: { options: NitroOptions }) => {
-    for (const [id, template] of deferredVirtuals.splice(0)) {
+  const renderDeferredVirtuals = async (nitro: { options: NitroOptions }) => {
+    const pending = deferredVirtuals.splice(0)
+    for (const [id, template] of pending) {
       try {
         const code = await trackPendingTemplate(id, template)
         if (typeof code === 'string') {
@@ -999,6 +1039,17 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
         // reported by the bundler when it renders the template itself
       }
     }
+    if (pending.length > 0) {
+      rescan(nitro.options.plugins as string[], nitro.options.handlers, nitro.options.virtual)
+      invalidateScopeCache()
+    }
+  }
+
+  // modules pushing straight into `nitro.options` from `nitro:init` are too late for the
+  // pass above, but the transform only consults the scope at build time
+  const registerLateScope = (nitro: Pick<Nitro, 'options' | 'hooks'>) => {
+    // templates may await hooks that run after `nitro:init`, such as `pages:resolved`
+    nitro.hooks.hookOnce('build:before', () => renderDeferredVirtuals(nitro))
 
     for (const handler of nitro.options.handlers || []) {
       const entry = handler as { handler?: unknown }
@@ -1025,6 +1076,17 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
 
     rescan(nitro.options.plugins as string[], nitro.options.handlers, nitro.options.virtual)
     invalidateScopeCache()
+
+    for (const handler of [...nitro.options.handlers || [], ...nitro.options.devHandlers || []]) {
+      if (!handler.route) {
+        handler.route = '/**'
+        handler.middleware = true
+      }
+    }
+
+    if (!isLegacyEnabled(legacy)) {
+      nitro.hooks.hookOnce('build:before', () => reportUserLegacyCode(getLayerDirectories(nuxt).flatMap(layer => [layer.server, layer.shared])))
+    }
   }
 
   // baked in at build time, so that an app with no v2 code keeps Nitro's error semantics
@@ -1054,9 +1116,11 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
   const unimport = createUnimport({ presets: modulePresets })
   await unimport.init()
 
+  const nitroResolutions = getNitroPackageResolutions()
+
   const plugin = createLegacyResolvePlugin(
     id => active ? scopeFor(id) : undefined,
-    getNitroPackageResolutions(),
+    nitroResolutions,
     (id, scope) => {
       files.set(id, scope)
       invalidateScopeCache()
@@ -1066,16 +1130,19 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
     unimport,
   )
 
+  const withNitro = nuxt as Nuxt & { _nitro?: { options: NitroOptions } }
+  const fallbackPlugin = createNitroFallbackResolvePlugin(nitroResolutions, () => withNitro._nitro?.options.exportConditions)
+
   nitroConfig.rollupConfig ||= {}
   nitroConfig.rollupConfig.plugins = toArray(nitroConfig.rollupConfig.plugins || [])
   nitroConfig.rollupConfig.plugins.unshift(plugin as any)
+  nitroConfig.rollupConfig.plugins.push(fallbackPlugin as any)
 
   if (nuxt.options.experimental.nitroViteEnvironment) {
+    const applyToEnvironment = (environment: { name: string }) => environment.name === 'nitro'
     nuxt.options.vite.plugins ||= []
-    nuxt.options.vite.plugins.push({
-      ...plugin,
-      applyToEnvironment: (environment: { name: string }) => environment.name === 'nitro',
-    } as any)
+    nuxt.options.vite.plugins.push({ ...plugin, applyToEnvironment } as any)
+    nuxt.options.vite.plugins.push({ ...fallbackPlugin, applyToEnvironment } as any)
   }
 
   return registerLateScope
@@ -1119,6 +1186,36 @@ function widenLegacyHandlerRoute (handler: { route?: string, middleware?: boolea
 
 interface ResolvePluginContext {
   resolve: (source: string, importer?: string, options?: { skipSelf?: boolean }) => Promise<{ id: string, external?: boolean | 'absolute' | 'relative' } | null>
+}
+
+const NITRO_SPECIFIER_RE = /^nitro(?:\/|$)/
+const NITRO_IMPLICIT_DEPENDENCY_RE = new RegExp(`^(?:${nitroImplicitDependencies.map(escapeRE).join('|')})(?:/|$)`)
+
+/**
+ * Resolve {@link nitroImplicitDependencies} for importers that cannot reach them.
+ *
+ * Ordered last, so it answers only what nitro's own resolution declined, and answers
+ * unconditionally: rolldown calls `resolveId` more than once per specifier, so a hook that
+ * probes with `this.resolve` before answering sees its own earlier answer and declines.
+ */
+function createNitroFallbackResolvePlugin (nitroResolutions: Record<string, string>, conditions: () => string[] | undefined) {
+  const resolutions = new Map<string, string | undefined>(Object.entries(nitroResolutions))
+  const from = [resolveModulePath('nitro/package.json', { from: import.meta.url, try: true }) ?? import.meta.url, import.meta.url]
+
+  return {
+    name: 'nuxt:nitro-resolve-fallback',
+    enforce: 'post' as const,
+    resolveId: {
+      order: 'post' as const,
+      filter: { id: NITRO_IMPLICIT_DEPENDENCY_RE },
+      handler (source: string) {
+        if (!resolutions.has(source)) {
+          resolutions.set(source, NITRO_SPECIFIER_RE.test(source) ? undefined : resolveModulePath(source, { from, conditions: conditions(), try: true }))
+        }
+        return resolutions.get(source)
+      },
+    },
+  }
 }
 
 function createLegacyResolvePlugin (
@@ -1173,14 +1270,9 @@ function createLegacyResolvePlugin (
     // needed so that the legacy auto-imports beat nitro's own pass on either build path
     enforce: 'pre' as const,
     resolveId: { order: 'pre' as const, async handler (this: ResolvePluginContext, source: string, importer?: string) {
-      // module code written against nitro cannot always reach it: fill that in, but only
-      // once the bundler has had its own go, so nitro keeps resolving itself
-      if (source === 'nitro' || source.startsWith('nitro/')) {
-        const fallback = nitroResolutions[source]
-        if (fallback && !await this.resolve(source, importer, { skipSelf: true })) {
-          return fallback
-        }
-        return
+      // a virtual importer has no location to resolve from, so nitro's own copy answers
+      if (importer && !isAbsolute(importer) && NITRO_SPECIFIER_RE.test(source)) {
+        return nitroResolutions[source]
       }
 
       const scope = scopeFor(importer)
@@ -1216,7 +1308,7 @@ function createLegacyResolvePlugin (
         return
       }
 
-      const specifiers = findImportSpecifiers(code)
+      const specifiers = findImportSpecifiers(code, id)
       const migrated = isMigrated(id, specifiers)
       const wantsImports = scope.imports && !migrated
 
