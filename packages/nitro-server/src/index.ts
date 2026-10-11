@@ -22,7 +22,7 @@ import { resolveModulePath } from 'exsolve'
 import { runtimeDependencies } from 'nitro/meta'
 
 import nitroBuilder from '../package.json' with { type: 'json' }
-import { PATHS_SPECIFIER, distDir, getLayerNodeModulesExcludePattern, getServerReplacements, getSsrResolveConditions, nitroImplicitDependencies, toArray, toFsDriverIgnorePatterns, toModulePackageDir } from './utils.ts'
+import { PATHS_SPECIFIER, distDir, getLayerNodeModulesExcludePattern, getServerReplacements, getSsrResolveConditions, nitroImplicitDependencies, toArray, toFsDriverIgnorePatterns, toModulePackageDir, toTranspileNoExternal } from './utils.ts'
 import { setupNitroViteEnvironment } from './vite.ts'
 import { setupLegacyDevAndBuild } from './legacy.ts'
 import { LOOPBACK_HOSTS, isLocalDevRequest, isLoopbackPeer } from './dev-request.ts'
@@ -37,7 +37,7 @@ import { createServerAutoImports, resolveServerImportDirs } from './auto-imports
 import { normalizeLegacyRouteRules } from './route-rules.ts'
 import { ServerAutoImportsPlugin } from './auto-imports-plugin.ts'
 import { getLegacyNitroAliases, getServerImportsPresets, resolveNitroLegacyOptions, setupNitroCompat, sortAliasesByPrecedence } from './compat.ts'
-import { collectServerRegistrations } from './registrations.ts'
+import { addDevServerHandlers, collectServerRegistrations } from './registrations.ts'
 // Re-export a type from the augment module rather than a bare `import './augments.ts'`
 // side-effect import to work around bug in oxc's dts emitter which drops side-effect-only imports
 export type { NuxtTracingChannelOptions } from './augments.ts'
@@ -351,7 +351,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
             '@nuxt/',
             nuxt.options.buildDir,
           ]),
-      ...nuxt.options.build.transpile.filter((i): i is string => typeof i === 'string'),
+      ...nuxt.options.build.transpile.filter((i): i is string => typeof i === 'string').map(toTranspileNoExternal),
       // path entries apply when nitro bundles with rollup; in the vite dev
       // environment `noExternal` is matched against the bare package name
       'nuxt/dist',
@@ -377,7 +377,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
             '@vue/compiler-dom': mockProxy,
             '@vue/compiler-ssr': mockProxy,
           },
-      '@vue/devtools-api': 'vue-devtools-stub',
+      '@vue/devtools-api': resolveModulePath('vue-devtools-stub', { from: import.meta.url }),
 
       // Nuxt aliases
       ...nuxt.options.alias,
@@ -393,6 +393,10 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
     },
     logLevel: logLevelMapReverse[nuxt.options.logLevel],
   } satisfies NitroConfig)
+
+  if (nuxt.options.sourcemap.server === 'nosource') {
+    nitroConfig.rollupConfig!.output!.sourcemapExcludeSources ??= true
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-deprecated
   if (nuxt.options.experimental.serverAppConfig === true && nitroConfig.imports) {
@@ -962,7 +966,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
     }
   }
 
-  nitro.options.devHandlers.push(...nuxt.options.devServerHandlers as NitroBuilderOptions['devHandlers'])
+  addDevServerHandlers(nitro.options.devHandlers, nuxt.options.devServerHandlers as NitroBuilderOptions['devHandlers'])
   if (nuxt.options.dev) {
     nitro.options.plugins.push(resolve(distDir, 'runtime/plugins/dev-errors'))
     nitro.options.handlers.unshift({
@@ -1127,14 +1131,14 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
       serverPaths['#app/island-hash'] ||= [resolve(appDir, 'island-hash')]
       serverPaths['#app/island-props'] ||= [resolve(appDir, 'island-props')]
       serverPaths['#app/internal/*'] ||= [resolve(appDir, 'internal/*')]
-      serverPaths['#app/types'] ||= [resolve(appDir, 'types')]
     }
 
-    // the generated route types import the request-shape extractors by package name, which the app
-    // program cannot resolve on its own: this package is a dependency of `nuxt`, not of the project
+    // the generated route types import the request-shape extractors by package name, which neither
+    // program can resolve on its own: this package is a dependency of `nuxt`, not of the project
     opts.tsConfig.compilerOptions ||= {}
     opts.tsConfig.compilerOptions.paths ||= {}
     opts.tsConfig.compilerOptions.paths[REQUEST_TYPES_MODULE] = [resolve(distDir, 'request-types')]
+    serverPaths[REQUEST_TYPES_MODULE] = [resolve(distDir, 'request-types')]
 
     // ensure aliases shared between nuxt + nitro are included in shared tsconfig
     opts.sharedTsConfig.compilerOptions ||= {}
